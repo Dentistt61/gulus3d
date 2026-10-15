@@ -421,6 +421,14 @@ frontView();
 
 /* =================== MediaPipe =================== */
 let fm = null, lastRes = null, fmStatic = null;
+let fmInit = null;
+const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+function envInfo() {
+  const gl2 = (() => { try { return !!document.createElement('canvas').getContext('webgl2'); } catch { return false; } })();
+  const ogl = (() => { try { return typeof OffscreenCanvas !== 'undefined' && !!new OffscreenCanvas(1, 1).getContext('webgl2'); } catch { return false; } })();
+  const ua = navigator.userAgent.replace(/^Mozilla\/5\.0 /, '').slice(0, 140);
+  return `[WebGL2: ${gl2 ? 'var' : 'yok'} · Offscreen: ${ogl ? 'var' : 'yok'} · ${ua}]`;
+}
 async function getFM(isStatic) {
   if (!fm) {
     fm = new FaceMesh({ locateFile: f => 'mp/' + f + (/\.(binarypb|data)$/.test(f) ? '.bin.wasm' : '') });
@@ -430,11 +438,14 @@ async function getFM(isStatic) {
     fm.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5, selfieMode: false, staticImageMode: isStatic });
     fmStatic = isStatic;
   }
-  await Promise.race([fm.initialize(), new Promise((_, rej) => setTimeout(() => rej(new Error('Yapay zekâ modeli yüklenemedi (zaman aşımı)')), 45000))]);
+  if (!fmInit) fmInit = withTimeout(fm.initialize(), 90000, 'Yapay zekâ modeli yüklenemedi (90 sn zaman aşımı; internet yavaş olabilir)').catch(e => { fmInit = null; throw e; });
+  await fmInit;
   return fm;
 }
+// sayfa açılınca yapay zekâyı arka planda hazırla; butona basıldığında beklemek gerekmesin
+setTimeout(() => { getFM(true).then(() => { const n = $('liveNote'); if (n && !n.dataset.err) n.textContent = 'Hazır. ' + n.textContent; }).catch(e => console.warn('ön yükleme', e)); }, 800);
 async function detect(small, W, H) { // small: algılama için küçük kare; W,H: tam boy
-  lastRes = null; await fm.send({ image: small });
+  lastRes = null; await withTimeout(fm.send({ image: small }), 15000, 'Yüz algılama yanıt vermiyor');
   const lm = lastRes && lastRes.multiFaceLandmarks && lastRes.multiFaceLandmarks[0];
   if (!lm) return null;
   const P = new Float32Array(NV*3);
@@ -560,7 +571,7 @@ async function onFiles(e) {
       big.width = big.height = 0;
     }
     await finishCollect();
-  } catch (err) { console.error(err); status('İşlem tamamlanamadı: ' + (err && err.message || err) + '. Daha kısa bir video ya da fotoğraflarla tekrar deneyin.', 'err', 0); }
+  } catch (err) { console.error(err); status('İşlem tamamlanamadı: ' + (err && err.message || err) + '. Daha kısa bir video ya da fotoğraflarla tekrar deneyin. ' + envInfo(), 'err', 0); }
 }
 $('file').addEventListener('change', onFiles);
 $('cam').addEventListener('change', onFiles);
@@ -593,14 +604,17 @@ $('live').onclick = startLive;
 async function startLive() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return liveUnavailable();
   $('liveUI').hidden = false; paused = true; document.body.style.overflow = 'hidden';
-  $('lvGuide').textContent = 'Kamera açılıyor…'; $('lvGuide').className = 'guide';
+  $('lvGuide').className = 'guide';
+  // önce yapay zekâ (kamera açıkken yüklemek telefonun belleğini zorluyor)
+  $('lvGuide').textContent = 'Yapay zekâ hazırlanıyor… (ilk açılışta ~16 MB indirilir)';
+  try { await getFM(false); await withTimeout(detect(fitCanvas(64, 64, 64), 64, 64), 20000, 'Yüz algılama başlatılamadı'); }
+  catch (err) { closeLive(); status('Canlı tarama başlatılamadı: ' + err.message + ' ' + envInfo(), 'err', 0); return; }
+  $('lvGuide').textContent = 'Kamera açılıyor…';
   try {
     await openStream();
   } catch (err) {
     console.warn(err); closeLive(); return liveUnavailable(err);
   }
-  $('lvGuide').textContent = 'Yapay zekâ hazırlanıyor…';
-  try { await getFM(false); } catch (err) { closeLive(); status(err.message, 'err', 0); return; }
   newCollector(); live.phase = 'scan'; setPhaseUI(); live.running = true; drawMap(null); updateCount();
   try { live.wake = await navigator.wakeLock?.request('screen'); } catch {}
   liveLoop();
@@ -611,12 +625,13 @@ async function openStream() {
   const v = $('lv'); v.srcObject = live.stream; v.classList.toggle('mirror', live.facing === 'user');
   await v.play().catch(() => {});
   if (!v.videoWidth) await once(v, 'loadedmetadata');
-  live.full = fitCanvas(v.videoWidth, v.videoHeight, 1600);
+  live.full = fitCanvas(v.videoWidth, v.videoHeight, 1280);
   live.small = fitCanvas(live.full.width, live.full.height, 640);
   $('lvFlip').textContent = live.facing === 'user' ? 'Arka kamera' : 'Ön kamera';
 }
-function liveUnavailable() {
-  status('Canlı kamera bu görünümde açılamıyor. "Video çek" ile devam edebilirsiniz; canlı tarama için programı kendi adresinden açın.', 'err', 0);
+function liveUnavailable(err) {
+  const why = err && err.name === 'NotAllowedError' ? 'Kamera izni verilmedi. Tarayıcı ayarlarından bu siteye kamera izni verin.' : 'Canlı kamera bu görünümde açılamıyor' + (err ? ` (${err.name || err.message})` : '') + '. "Video çek" ile devam edebilirsiniz; canlı tarama için programı kendi adresinden açın.';
+  status(why, 'err', 0); $('liveNote').dataset.err = '1';
   $('liveNote').textContent = 'Canlı kamera burada kapalı. "Video çek" butonu aynı işi kayıttan yapar.';
 }
 function closeLive() {
@@ -660,12 +675,13 @@ async function liveLoop() {
   const v = $('lv');
   while (live.running) {
     if (v.readyState >= 2 && v.videoWidth) {
-      const cap = live.phase === 'mouth' ? 1280 : 1600;
+      const cap = 1280;
       const want = Math.round(v.videoWidth * Math.min(1, cap / Math.max(v.videoWidth, v.videoHeight)));
       if (live.full.width !== want) { live.full = fitCanvas(v.videoWidth, v.videoHeight, cap); live.small = fitCanvas(live.full.width, live.full.height, 640); }
       const full = live.full; full.getContext('2d').drawImage(v, 0, 0, full.width, full.height);
       let P = null;
-      try { P = await detect(smallFrom(full, live.small), full.width, full.height); } catch (e) { console.warn(e); }
+      try { P = await detect(smallFrom(full, live.small), full.width, full.height); }
+      catch (e) { console.warn(e); closeLive(); status('Canlı tarama durdu: ' + e.message + ' ' + envInfo(), 'err', 0); return; }
       if (!live.running) break;
       if (live.phase === 'mouth') { await mouthStep(P, full); await new Promise(r => requestAnimationFrame(r)); continue; }
       let ev = null, kept = false;
