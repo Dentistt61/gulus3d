@@ -104,6 +104,7 @@ details li span{color:var(--muted)}
 .live-bottom canvas{width:min(100%,340px);height:auto;aspect-ratio:340/128}
 .live-bottom button{width:min(100%,340px);background:var(--cam-hit);color:#06201f;border:0;font:600 16px var(--f-body);padding:14px;border-radius:14px;cursor:pointer}
 .live-bottom button:disabled{background:var(--cam-slot);color:var(--cam-dim);cursor:not-allowed}
+.live-bottom button.ghost{background:transparent;color:var(--cam-ink);border:1px solid var(--cam-slot);padding:11px;font-weight:500}
 .live-bottom p{margin:0;color:var(--cam-dim);font-size:12.5px;text-align:center}
 @media (prefers-reduced-motion: reduce){.bar i{transition:none}}
 </style>
@@ -133,7 +134,9 @@ details li span{color:var(--muted)}
         <li>Hasta gülümser ve <strong>ifadesini hiç bozmaz</strong>. <span>İfade değişirse model bozulur.</span></li>
         <li>Telefonu yüzden 40–50 cm uzakta, göz hizasında tutun. Yüz ekranın büyük kısmını kaplasın.</li>
         <li>Hasta başını <strong>yavaşça</strong> ok yönünde çevirir: önce bir yana, sonra öbür yana, sonra hafif öne ve yukarı.</li>
-        <li>Düz, gölgesiz ışık kullanın. Arkadan gelen ışık (pencere) dokuyu bozar.</li>
+        <li>Düz, gölgesiz ışık kullanın. Arkadan gelen ışık (pencere) dokuyu bozar. Flaş kullanmayın, dişlerde parlama yapar.</li>
+        <li>Tarama sonunda program <strong>ağız yakın çekimi</strong> ister: telefonu gülüşe 20–25 cm yaklaştırıp ağız hizasında sabit tutun. Dişlerin netliği bu adımdan gelir.</li>
+        <li>Galeriden seçerken ağzı yakından çekilmiş net bir fotoğrafı da ekleyebilirsiniz; program onu ağız için kullanır.</li>
       </ol>
     </details>
     <div class="status" id="status" hidden>
@@ -203,7 +206,8 @@ details li span{color:var(--muted)}
   </div>
   <div class="live-bottom">
     <canvas id="lvMap" width="680" height="256" aria-label="Toplanan açılar"></canvas>
-    <button id="lvDone" type="button" disabled>Bitir ve modelle</button>
+    <button id="lvDone" type="button" disabled>Devam: ağız yakın çekimi</button>
+    <button id="lvSkip" class="ghost" type="button" hidden>Atla ve modelle</button>
     <p id="lvHint">Önden, iki yandan en az birer açı gerekiyor.</p>
   </div>
 </div>
@@ -227,6 +231,16 @@ import { UV, TRI, CANON } from './facedata.js';
 
 const $ = id => document.getElementById(id);
 const NV = 468, NT = TRI.length / 3, ATLAS = 2048;
+const LIPS = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185];
+const MOUTH = (() => { // ağız bölgesi: dudaklar + çevresindeki ince deri şeridi
+  const C = CANON, mx = (C[61][0]+C[291][0])/2, my = (C[61][1]+C[291][1])/2;
+  const a = Math.abs(C[61][0]-C[291][0])/2*1.35, b = Math.abs(C[0][1]-C[17][1])/2*1.6;
+  const mask = new Uint8Array(NV), triMask = new Uint8Array(NT), tris = [];
+  for (let i = 0; i < NV; i++) mask[i] = ((C[i][0]-mx)/a)**2 + ((C[i][1]-my)/b)**2 <= 1 ? 1 : 0;
+  for (let t = 0; t < NT; t++) if (mask[TRI[t*3]] && mask[TRI[t*3+1]] && mask[TRI[t*3+2]]) { triMask[t] = 1; tris.push(TRI[t*3], TRI[t*3+1], TRI[t*3+2]); }
+  return { mask, triMask, tris };
+})();
+const UVFLAT = new Float32Array(UV.flat());
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 const deg = r => r * 180 / Math.PI;
@@ -249,9 +263,10 @@ const matTex = new THREE.MeshStandardMaterial({ roughness: 0.72, metalness: 0, s
 const matClay = new THREE.MeshStandardMaterial({ color: 0xd8c4b4, roughness: 0.65, side: THREE.DoubleSide });
 const matWire = new THREE.MeshBasicMaterial({ color: 0x0d6b67, wireframe: true });
 const matHead = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, side: THREE.DoubleSide });
+const matMouth = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0, side: THREE.DoubleSide });
 const root = new THREE.Group(); scene.add(root);
 const measureGroup = new THREE.Group(); scene.add(measureGroup);
-let faceMesh = null, headMesh = null, neckMesh = null, mode = 'clay', headOn = true, paused = false;
+let faceMesh = null, mouthMesh = null, faceGeoFull = null, headMesh = null, neckMesh = null, mode = 'clay', headOn = true, paused = false;
 let model = null; // {pos, atlas, eyeRaw, skin, hair, id, name}
 let measuring = false, mpts = [];
 
@@ -349,14 +364,32 @@ function buildHead(pos, idx, edgeColor, skin, hair) {
   return { head: g, neck: ng };
 }
 
-function setModelMeshes(pos, atlas, skin, hair) {
-  for (const m of [faceMesh, headMesh, neckMesh]) if (m) { root.remove(m); m.geometry.dispose(); }
+function mouthUV(pos) { // önden düzlemsel açılım: dişler ve ağız boşluğu dokuda gerçek oranında yer kaplar
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let i = 0; i < NV; i++) if (MOUTH.mask[i]) { const x = pos[i*3], y = pos[i*3+1]; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+  const w = (x1-x0)*1.04, h = (y1-y0)*1.04, cx = (x0+x1)/2, cy = (y0+y1)/2, uv = new Float32Array(NV*2);
+  for (let i = 0; i < NV; i++) { uv[i*2] = 0.5 + (pos[i*3]-cx)/w; uv[i*2+1] = 0.5 + (pos[i*3+1]-cy)/h; }
+  return { uv, aspect: h / w };
+}
+function setModelMeshes(pos, atlas, skin, hair, mouthTex) {
+  for (const m of [faceMesh, mouthMesh, headMesh, neckMesh]) if (m) { root.remove(m); m.geometry.dispose(); }
+  if (faceGeoFull) faceGeoFull.dispose();
+  mouthMesh = null;
   const idx = faceIndex(pos);
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(UV.flat()), 2));
+  g.setAttribute('uv', new THREE.BufferAttribute(UVFLAT.slice(), 2));
   g.setIndex(idx); g.computeVertexNormals();
-  faceMesh = new THREE.Mesh(g, matClay); root.add(faceMesh);
+  faceGeoFull = g;
+  if (mouthTex) { // ağız ayrı, yüksek çözünürlüklü dokuyla
+    const rest = [], mo = [];
+    for (let t = 0; t < NT; t++) (MOUTH.triMask[t] ? mo : rest).push(idx[t*3], idx[t*3+1], idx[t*3+2]);
+    const gr = new THREE.BufferGeometry(), gm = new THREE.BufferGeometry();
+    for (const k of ['position', 'normal']) { gr.setAttribute(k, g.attributes[k]); gm.setAttribute(k, g.attributes[k]); }
+    gr.setAttribute('uv', g.attributes.uv); gr.setIndex(rest);
+    gm.setAttribute('uv', new THREE.BufferAttribute(mouthUV(pos).uv, 2)); gm.setIndex(mo);
+    faceMesh = new THREE.Mesh(gr, matClay); mouthMesh = new THREE.Mesh(gm, matClay); root.add(faceMesh, mouthMesh);
+  } else { faceMesh = new THREE.Mesh(g.clone(), matClay); root.add(faceMesh); }
   let edgeColor = () => skin;
   if (atlas) {
     const d = atlas.getContext('2d').getImageData(0, 0, ATLAS, ATLAS).data;
@@ -370,6 +403,7 @@ function setModelMeshes(pos, atlas, skin, hair) {
 function applyMode() {
   if (!faceMesh) return;
   faceMesh.material = mode === 'tex' ? matTex : mode === 'wire' ? matWire : matClay;
+  if (mouthMesh) mouthMesh.material = mode === 'tex' ? matMouth : mode === 'wire' ? matWire : matClay;
   for (const m of [headMesh, neckMesh]) { m.material = mode === 'tex' ? matHead : mode === 'wire' ? matWire : matClay; m.visible = headOn; }
   for (const [id, m] of [['m-tex','tex'],['m-clay','clay'],['m-wire','wire']]) $(id).setAttribute('aria-pressed', String(mode === m));
   $('headBtn').setAttribute('aria-pressed', String(headOn));
@@ -377,7 +411,7 @@ function applyMode() {
 for (const [id, m] of [['m-tex','tex'],['m-clay','clay'],['m-wire','wire']]) $(id).onclick = () => { mode = m; applyMode(); };
 $('reset').onclick = frontView;
 $('headBtn').onclick = () => { headOn = !headOn; applyMode(); frontView(); };
-$('hair').addEventListener('change', () => { if (model) { model.hair = hexToRgb($('hair').value); setModelMeshes(model.pos, model.atlas, model.skin, model.hair); } });
+$('hair').addEventListener('change', () => { if (model) { model.hair = hexToRgb($('hair').value); setModelMeshes(model.pos, model.atlas, model.skin, model.hair, model.mouthTex); } });
 function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16 & 255)/255, (n >> 8 & 255)/255, (n & 255)/255]; }
 function rgbToHex(c) { return '#' + c.map(x => Math.round(clamp(x, 0, 1)*255).toString(16).padStart(2, '0')).join(''); }
 
@@ -426,6 +460,22 @@ function faceStats(cv, P) {
   return { sh: s / (126*126), lum: lum / (126*126) };
 }
 
+const tmpM = document.createElement('canvas'); tmpM.width = 192; tmpM.height = 96;
+const mctx = tmpM.getContext('2d', { willReadFrequently: true });
+function lipBox(P, pad) { let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const i of LIPS) { const x = P[i*3], y = P[i*3+1]; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+  const w = x1-x0, h = y1-y0; return { x0: x0 - w*pad, y0: y0 - h*pad, w: w*(1+2*pad), h: h*(1+2*pad) }; }
+function mouthStats(cv, P) { // ağız netliği ve genişliği (piksel)
+  const b = lipBox(P, 0.08);
+  mctx.drawImage(cv, b.x0, b.y0, Math.max(8, b.w), Math.max(4, b.h), 0, 0, 192, 96);
+  const d = mctx.getImageData(0, 0, 192, 96).data; let s = 0;
+  const g = i => d[i*4]*.3 + d[i*4+1]*.59 + d[i*4+2]*.11;
+  for (let y = 1; y < 95; y++) for (let x = 1; x < 191; x++) { const i = y*192+x; s += Math.abs(4*g(i) - g(i-1) - g(i+1) - g(i-192) - g(i+192)); }
+  // küçük ağızda örnekleme netliği abartır: piksel genişliğiyle ölçekle
+  const mw = Math.hypot(P[61*3]-P[291*3], P[61*3+1]-P[291*3+1]);
+  return { msh: s / (190*94) * Math.min(1, mw / 192), mw };
+}
+
 /* =================== açı toplama =================== */
 const BIN_IDS = ['L2','L1','L0','C','R0','R1','R2','U','D'];
 const BIN_LABEL = { L2:'◀ 35°', L1:'◀ 20°', L0:'◀ 10°', C:'Önden', R0:'10° ▶', R1:'20° ▶', R2:'35° ▶', U:'Üstten', D:'Alttan' };
@@ -438,16 +488,31 @@ function binOf(yaw, rp, loose) {
   return yaw > 28 ? 'R2' : yaw > 15 ? 'R1' : 'R0';
 }
 let col = null;
-function newCollector() { if (col) for (const b of Object.values(col.bins)) { b.cv.width = b.cv.height = 0; } col = { bins: {}, pitch0: null, faces: 0 }; }
+function newCollector() { if (col) for (const b of [...Object.values(col.bins), ...col.front, ...col.close]) { b.cv.width = b.cv.height = 0; } col = { bins: {}, pitch0: null, faces: 0, front: [], close: [] }; }
+function copyCanvas(src) { const cv = document.createElement('canvas'); cv.width = src.width; cv.height = src.height; cv.getContext('2d').drawImage(src, 0, 0); return cv; }
+function keepTop(list, src, P, ev, n) {
+  if (list.length >= n && ev.msh <= list[list.length-1].msh) return false;
+  list.push({ cv: copyCanvas(src), P, ...ev }); list.sort((a, b) => b.msh - a.msh);
+  while (list.length > n) { const x = list.pop(); x.cv.width = x.cv.height = 0; }
+  return true;
+}
+const isClose = (ev, src) => ev.mw >= 0.12 * Math.max(src.width, src.height) && ev.mw >= 260 && Math.abs(ev.yaw) <= 12 && Math.abs(ev.rp) <= 14;
+function considerExtra(src, P, ev, noClose) { // ağız için: en net önden kareler ve yakın çekimler
+  let k = false;
+  if (Math.abs(ev.yaw) <= 8 && Math.abs(ev.rp) <= 10 && ev.eye >= 45) k = keepTop(col.front, src, P, ev, 3) || k;
+  if (!noClose && isClose(ev, src)) k = keepTop(col.close, src, P, ev, 3) || k;
+  return k;
+}
 function evaluate(src, P, loose) {
   const { yaw, pitch } = pose(P);
   if (Math.abs(yaw) < 8) col.pitch0 = col.pitch0 == null ? pitch : col.pitch0 * 0.9 + pitch * 0.1;
   const rp = pitch - (col.pitch0 == null ? pitch : col.pitch0);
   const eye = Math.hypot(P[33*3]-P[263*3], P[33*3+1]-P[263*3+1]);
   const { sh, lum } = faceStats(src, P);
+  const { msh, mw } = mouthStats(src, P);
   const bin = eye >= 45 ? binOf(yaw, rp, loose) : null;
-  const score = bin === 'C' ? sh / (1 + Math.abs(yaw)/8 + Math.abs(rp)/8) : sh;
-  return { yaw, pitch, rp, eye, sh, lum, bin, score };
+  const score = bin === 'C' ? (0.35*sh + 0.65*msh) / (1 + Math.abs(yaw)/8 + Math.abs(rp)/8) : sh;
+  return { yaw, pitch, rp, eye, sh, lum, bin, score, msh, mw };
 }
 function maybeKeep(src, P, ev) {
   if (!ev.bin) return false;
@@ -481,10 +546,18 @@ async function onFiles(e) {
     for (const vf of videos) await processVideo(vf);
     for (let i = 0; i < images.length; i++) {
       status(`Fotoğraf inceleniyor ${i+1}/${images.length}…`, '', 0.1 + 0.6 * (i+1) / images.length);
-      const bmp = await loadImage(images[i]); const full = fitCanvas(bmp.width, bmp.height, 1600);
-      full.getContext('2d').drawImage(bmp, 0, 0, full.width, full.height);
-      const P = await detect(smallFrom(full, fitCanvas(full.width, full.height, 640)), full.width, full.height);
-      if (P) { col.faces++; maybeKeep(full, P, evaluate(full, P, true)); }
+      const bmp = await loadImage(images[i]); const big = fitCanvas(bmp.width, bmp.height, 4096);
+      big.getContext('2d').drawImage(bmp, 0, 0, big.width, big.height);
+      const Pb = await detect(smallFrom(big, fitCanvas(big.width, big.height, 640)), big.width, big.height);
+      if (!Pb) continue;
+      col.faces++;
+      const evb = evaluate(big, Pb, true);
+      if (isClose(evb, big)) keepTop(col.close, big, Pb, evb, 3);
+      const full = fitCanvas(big.width, big.height, 1600), k = full.width / big.width;
+      full.getContext('2d').drawImage(big, 0, 0, full.width, full.height);
+      const P = Pb.map(x => x * k), ev = evaluate(full, P, true);
+      maybeKeep(full, P, ev); considerExtra(full, P, ev, true);
+      big.width = big.height = 0;
     }
     await finishCollect();
   } catch (err) { console.error(err); status('İşlem tamamlanamadı: ' + (err && err.message || err) + '. Daha kısa bir video ya da fotoğraflarla tekrar deneyin.', 'err', 0); }
@@ -509,13 +582,13 @@ async function processVideo(file) {
     status(`Video kareleri inceleniyor ${i+1}/${N}…`, '', 0.05 + 0.7 * (i+1) / N);
     fc.drawImage(v, 0, 0, full.width, full.height);
     const P = await detect(smallFrom(full, small), full.width, full.height);
-    if (P) { col.faces++; maybeKeep(full, P, evaluate(full, P, false)); }
+    if (P) { col.faces++; const ev = evaluate(full, P, false); maybeKeep(full, P, ev); considerExtra(full, P, ev); }
   }
   URL.revokeObjectURL(v.src);
 }
 
 /* =================== canlı tarama =================== */
-const live = { running: false, stream: null, facing: 'environment', full: null, small: null, raf: 0, lastBin: null, flashUntil: 0, wake: null };
+const live = { phase: 'scan', mouthStart: 0, lastClose: 0, bestMsh: 0, running: false, stream: null, facing: 'environment', full: null, small: null, raf: 0, lastBin: null, flashUntil: 0, wake: null };
 $('live').onclick = startLive;
 async function startLive() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return liveUnavailable();
@@ -528,7 +601,7 @@ async function startLive() {
   }
   $('lvGuide').textContent = 'Yapay zekâ hazırlanıyor…';
   try { await getFM(false); } catch (err) { closeLive(); status(err.message, 'err', 0); return; }
-  newCollector(); live.running = true; drawMap(null); updateCount();
+  newCollector(); live.phase = 'scan'; setPhaseUI(); live.running = true; drawMap(null); updateCount();
   try { live.wake = await navigator.wakeLock?.request('screen'); } catch {}
   liveLoop();
 }
@@ -554,29 +627,78 @@ function closeLive() {
 }
 $('lvClose').onclick = () => { closeLive(); };
 $('lvFlip').onclick = async () => { live.facing = live.facing === 'user' ? 'environment' : 'user'; try { await openStream(); newCollector(); updateCount(); } catch (e) { $('lvGuide').textContent = 'Kamera değiştirilemedi'; } };
-$('lvDone').onclick = async () => { closeLive(); await finishCollect(); };
+$('lvDone').onclick = async () => { if (live.phase === 'scan') startMouthPhase(); else await grabClose(true); };
+$('lvSkip').onclick = async () => { closeLive(); await finishCollect(); };
+function setPhaseUI() {
+  const m = live.phase === 'mouth';
+  $('lvMap').hidden = m; $('lvSkip').hidden = !m;
+  $('lvDone').textContent = m ? 'Şimdi çek' : 'Devam: ağız yakın çekimi';
+  if (m) { $('lvDone').disabled = false; $('lvHint').textContent = 'Program net anı kendisi yakalar; isterseniz "Şimdi çek"e basın.'; }
+}
+async function startMouthPhase() {
+  live.phase = 'mouth'; live.mouthStart = performance.now(); live.bestMsh = 0; live.lastClose = 0;
+  setPhaseUI(); updateCount();
+  const tr = live.stream && live.stream.getVideoTracks()[0];
+  if (tr) { // ağız için en yüksek çözünürlük ve sürekli netleme
+    try { await tr.applyConstraints({ width: { ideal: 3840 }, height: { ideal: 2160 } }); } catch {}
+    try { const cap = tr.getCapabilities ? tr.getCapabilities() : {}; if (cap.focusMode && cap.focusMode.includes('continuous')) await tr.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch {}
+  }
+}
+async function grabClose(manual) { // tam çözünürlükte kare al, yüzü yeniden bul, ağız listesine ekle
+  const v = $('lv'); if (!v.videoWidth) return false;
+  const big = fitCanvas(v.videoWidth, v.videoHeight, 4096); big.getContext('2d').drawImage(v, 0, 0, big.width, big.height);
+  const P = await detect(smallFrom(big, fitCanvas(big.width, big.height, 640)), big.width, big.height);
+  if (!P) { big.width = big.height = 0; if (manual) flashGuide('Yüz bulunamadı, biraz uzaklaşın'); return false; }
+  const ev = evaluate(big, P, false);
+  const ok = keepTop(col.close, big, P, ev, 3); big.width = big.height = 0;
+  if (ok) { live.flashUntil = performance.now() + 600; try { navigator.vibrate && navigator.vibrate(25); } catch {} updateCount(); }
+  return ok;
+}
+function flashGuide(t) { $('lvGuide').textContent = t; $('lvGuide').className = 'guide'; }
 
 async function liveLoop() {
   const v = $('lv');
   while (live.running) {
     if (v.readyState >= 2 && v.videoWidth) {
-      const want = Math.round(v.videoWidth * Math.min(1, 1600 / Math.max(v.videoWidth, v.videoHeight)));
-      if (live.full.width !== want) { live.full = fitCanvas(v.videoWidth, v.videoHeight, 1600); live.small = fitCanvas(live.full.width, live.full.height, 640); }
+      const cap = live.phase === 'mouth' ? 1280 : 1600;
+      const want = Math.round(v.videoWidth * Math.min(1, cap / Math.max(v.videoWidth, v.videoHeight)));
+      if (live.full.width !== want) { live.full = fitCanvas(v.videoWidth, v.videoHeight, cap); live.small = fitCanvas(live.full.width, live.full.height, 640); }
       const full = live.full; full.getContext('2d').drawImage(v, 0, 0, full.width, full.height);
       let P = null;
       try { P = await detect(smallFrom(full, live.small), full.width, full.height); } catch (e) { console.warn(e); }
       if (!live.running) break;
+      if (live.phase === 'mouth') { await mouthStep(P, full); await new Promise(r => requestAnimationFrame(r)); continue; }
       let ev = null, kept = false;
-      if (P) { col.faces++; ev = evaluate(full, P, false); kept = maybeKeep(full, P, ev); }
+      if (P) { col.faces++; ev = evaluate(full, P, false); kept = maybeKeep(full, P, ev); considerExtra(full, P, ev); }
       if (kept) { live.flashUntil = performance.now() + 700; live.lastBin = ev.bin; try { navigator.vibrate && navigator.vibrate(25); } catch {} updateCount(); }
       drawOverlay(P, full); drawMap(ev); guide(P, ev);
-      if (BIN_IDS.every(b => col.bins[b])) { $('lvGuide').textContent = 'Tüm açılar tamam!'; await new Promise(r => setTimeout(r, 500)); closeLive(); await finishCollect(); return; }
+      if (BIN_IDS.every(b => col.bins[b])) { $('lvGuide').textContent = 'Tüm açılar tamam!'; await new Promise(r => setTimeout(r, 600)); startMouthPhase(); }
     }
     await new Promise(r => requestAnimationFrame(r));
   }
 }
+async function mouthStep(P, full) {
+  drawOverlay(P, full, true);
+  const g = $('lvGuide'); let t, good = false;
+  if (!P) t = 'Yüz görünmüyor, biraz uzaklaşın';
+  else {
+    const ev = evaluate(full, P, false), ratio = ev.mw / Math.max(full.width, full.height);
+    if (ratio < 0.13) t = 'Telefonu gülüşe yaklaştırın';
+    else if (Math.abs(ev.yaw) > 12 || Math.abs(ev.rp) > 14) t = 'Kameraya düz baksın, telefon ağız hizasında';
+    else if (ev.lum < 55) t = 'Işık yetersiz';
+    else {
+      live.bestMsh = Math.max(live.bestMsh * 0.995, ev.msh);
+      t = 'Sabit tutun…'; good = true;
+      const now = performance.now();
+      if (ev.msh >= 0.85 * live.bestMsh && now - live.lastClose > 300) { live.lastClose = now; await grabClose(false); }
+    }
+  }
+  if (performance.now() < live.flashUntil) { t = '✓ Ağız çekildi (' + col.close.length + '/3)'; good = true; }
+  g.textContent = t; g.className = 'guide' + (good ? ' good' : '');
+  if (col.close.length >= 3 && performance.now() - live.mouthStart > 2500) { g.textContent = 'Tamam!'; await new Promise(r => setTimeout(r, 400)); closeLive(); await finishCollect(); }
+}
 const isMirror = () => live.facing === 'user';
-function drawOverlay(P, full) {
+function drawOverlay(P, full, lipsOnly) {
   const c = $('lvo'), r = c.getBoundingClientRect(), dpr = Math.min(devicePixelRatio, 2);
   if (c.width !== Math.round(r.width*dpr)) { c.width = Math.round(r.width*dpr); c.height = Math.round(r.height*dpr); }
   const ctx = c.getContext('2d'); ctx.clearRect(0, 0, c.width, c.height);
@@ -584,7 +706,7 @@ function drawOverlay(P, full) {
   const k = Math.min(c.width / full.width, c.height / full.height), ox = (c.width - full.width*k)/2, oy = (c.height - full.height*k)/2;
   ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--cam-hit').trim() || '#3fd1c4';
   ctx.globalAlpha = 0.75;
-  for (let i = 0; i < NV; i += 2) { let x = P[i*3]*k + ox; if (isMirror()) x = c.width - x; ctx.fillRect(x - dpr, P[i*3+1]*k + oy - dpr, 2*dpr, 2*dpr); }
+  for (const i of (lipsOnly ? LIPS : null) || Array.from({ length: NV / 2 }, (_, j) => j * 2)) { let x = P[i*3]*k + ox; if (isMirror()) x = c.width - x; ctx.fillRect(x - dpr, P[i*3+1]*k + oy - dpr, 2*dpr, 2*dpr); }
   ctx.globalAlpha = 1;
 }
 function drawMap(ev) {
@@ -612,10 +734,11 @@ function drawMap(ev) {
 function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x+r, y); ctx.arcTo(x+w, y, x+w, y+h, r); ctx.arcTo(x+w, y+h, x, y+h, r); ctx.arcTo(x, y+h, x, y, r); ctx.arcTo(x, y, x+w, y, r); ctx.closePath(); }
 function updateCount() {
   const n = col ? BIN_IDS.filter(b => col.bins[b]).length : 0;
-  $('lvCount').textContent = `${n} / 9 açı`;
+  $('lvCount').textContent = live.phase === 'mouth' ? `Ağız ${col ? col.close.length : 0} / 3` : `${n} / 9 açı`;
+  if (live.phase === 'mouth') return;
   const ok = col && col.bins.C && ['L0','L1','L2'].some(b => col.bins[b]) && ['R0','R1','R2'].some(b => col.bins[b]);
   $('lvDone').disabled = !ok;
-  $('lvHint').textContent = ok ? (n < 9 ? 'Yeterli. Daha fazla açı modeli iyileştirir, isterseniz bitirin.' : 'Tamam.') : 'Önden, iki yandan en az birer açı gerekiyor.';
+  $('lvHint').textContent = ok ? (n < 9 ? 'Yeterli. Daha fazla açı modeli iyileştirir, isterseniz ağız çekimine geçin.' : 'Tamam.') : 'Önden, iki yandan en az birer açı gerekiyor.';
 }
 function guide(P, ev) {
   const g = $('lvGuide'); let t, good = false;
@@ -639,10 +762,11 @@ async function finishCollect() {
   const views = BIN_IDS.map(b => col.bins[b]).filter(Boolean);
   if (!views.length) { status(col.faces ? 'Yüz bulundu ama net kare yok. Yaklaşıp daha yavaş çekin.' : 'Hiçbir karede yüz bulunamadı. Yüz kadrajda büyük ve iyi aydınlatılmış olmalı.', 'err', 0); return; }
   status('Doku haritası hazırlanıyor…', '', 0.85); await tick();
-  try { buildModel(views); }
+  try { await buildModel(views); }
   catch (err) { console.error(err); status('Model oluşturulamadı: ' + (err && err.message || err), 'err', 0); return; }
   const n = views.length;
-  status(`Model hazır · ${n} açı kullanıldı.` + (n < 3 ? ' Yanlardan da açı olursa doku daha iyi olur.' : ''), 'ok', 1);
+  const mouthNote = col.close.length ? ` Ağız ${col.close.length} yakın çekimden alındı.` : ' Ağız için yakın çekim yok; dişler önden karelerden alındı.';
+  status(`Model hazır · ${n} açı kullanıldı.` + mouthNote + (n < 3 ? ' Yanlardan da açı olursa doku daha iyi olur.' : ''), 'ok', 1);
 }
 function pickFrontal(views) {
   if (col.bins.C) return col.bins.C;
@@ -686,14 +810,15 @@ const bakeMat = new THREE.RawShaderMaterial({
   blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
   blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneFactor,
 });
-function bake(views, W, skinHex) {
-  const S = ATLAS, geo = new THREE.BufferGeometry(), up = new Float32Array(NV*3);
-  for (let i = 0; i < NV; i++) { up[i*3] = UV[i][0]; up[i*3+1] = UV[i][1]; }
-  geo.setAttribute('position', new THREE.BufferAttribute(up, 3)); geo.setIndex(TRI.slice());
-  const mesh = new THREE.Mesh(geo, bakeMat); mesh.frustumCulled = false;
+const bakeMatReplace = bakeMat.clone(); bakeMatReplace.blending = THREE.NoBlending; bakeMatReplace.transparent = false;
+function bake(views, W, skinHex, uvArr = UVFLAT, tris = TRI, SW = ATLAS, SH = ATLAS, mat = bakeMat) {
+  const geo = new THREE.BufferGeometry(), up = new Float32Array(NV*3);
+  for (let i = 0; i < NV; i++) { up[i*3] = uvArr[i*2]; up[i*3+1] = uvArr[i*2+1]; }
+  geo.setAttribute('position', new THREE.BufferAttribute(up, 3)); geo.setIndex(tris.slice());
+  const mesh = new THREE.Mesh(geo, mat); mesh.frustumCulled = false;
   const bscene = new THREE.Scene(); bscene.add(mesh);
   const bcam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  const rt = new THREE.WebGLRenderTarget(S, S, { depthBuffer: false });
+  const rt = new THREE.WebGLRenderTarget(SW, SH, { depthBuffer: false });
   const prevClear = renderer.getClearAlpha();
   renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.autoClear = false;
   views.forEach((v, k) => {
@@ -702,30 +827,94 @@ function bake(views, W, skinHex) {
     geo.setAttribute('img', new THREE.BufferAttribute(img, 2));
     geo.setAttribute('w', new THREE.BufferAttribute(W[k], 1));
     const tex = new THREE.CanvasTexture(v.cv); tex.generateMipmaps = false; tex.minFilter = THREE.LinearFilter; tex.colorSpace = THREE.NoColorSpace;
-    bakeMat.uniforms.map.value = tex; bakeMat.uniforms.gain.value.set(...v.gain);
+    mat.uniforms.map.value = tex; mat.uniforms.gain.value.set(...v.gain);
     renderer.render(bscene, bcam); tex.dispose();
   });
-  const buf = new Uint8Array(S*S*4); renderer.readRenderTargetPixels(rt, 0, 0, S, S, buf);
+  const buf = new Uint8Array(SW*SH*4); renderer.readRenderTargetPixels(rt, 0, 0, SW, SH, buf);
   renderer.setRenderTarget(null); renderer.autoClear = true; renderer.setClearColor(0x000000, prevClear);
   rt.dispose(); geo.dispose();
-  const atlas = document.createElement('canvas'); atlas.width = atlas.height = S;
-  const ctx = atlas.getContext('2d', { willReadFrequently: true }), id = ctx.createImageData(S, S);
-  for (let y = 0; y < S; y++) { const src = (S-1-y)*S*4; id.data.set(buf.subarray(src, src + S*4), y*S*4); }
+  const atlas = document.createElement('canvas'); atlas.width = SW; atlas.height = SH;
+  const ctx = atlas.getContext('2d', { willReadFrequently: true }), id = ctx.createImageData(SW, SH);
+  for (let y = 0; y < SH; y++) { const src = (SH-1-y)*SW*4; id.data.set(buf.subarray(src, src + SW*4), y*SW*4); }
   for (let i = 3; i < id.data.length; i += 4) id.data[i] = id.data[i] > 8 ? 255 : 0;
   ctx.putImageData(id, 0, 0);
   // dikiş payı: kenarları dışa doğru taşır
-  const cp = document.createElement('canvas'); cp.width = cp.height = S; const cpx = cp.getContext('2d');
+  const cp = document.createElement('canvas'); cp.width = SW; cp.height = SH; const cpx = cp.getContext('2d');
   for (const r of [2, 4, 8, 16]) {
-    cpx.clearRect(0, 0, S, S); cpx.drawImage(atlas, 0, 0);
+    cpx.clearRect(0, 0, SW, SH); cpx.drawImage(atlas, 0, 0);
     ctx.globalCompositeOperation = 'destination-over';
     for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]]) ctx.drawImage(cp, dx*r, dy*r);
     ctx.globalCompositeOperation = 'source-over';
   }
-  ctx.globalCompositeOperation = 'destination-over'; ctx.fillStyle = skinHex; ctx.fillRect(0, 0, S, S); ctx.globalCompositeOperation = 'source-over';
+  ctx.globalCompositeOperation = 'destination-over'; ctx.fillStyle = skinHex; ctx.fillRect(0, 0, SW, SH); ctx.globalCompositeOperation = 'source-over';
   cp.width = cp.height = 0;
   return atlas;
 }
-function buildModel(views) {
+function grayOf(cv, w) {
+  const h = Math.max(8, Math.round(w * cv.height / cv.width)), c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(cv, 0, 0, w, h);
+  const d = x.getImageData(0, 0, w, h).data, g = new Float32Array(w*h);
+  for (let i = 0; i < w*h; i++) g[i] = d[i*4]*.3 + d[i*4+1]*.59 + d[i*4+2]*.11;
+  return { g, w, h };
+}
+function lapSharp({ g, w, h }) { let s = 0; for (let y = 1; y < h-1; y++) for (let x = 1; x < w-1; x++) { const i = y*w+x; s += Math.abs(4*g[i]-g[i-1]-g[i+1]-g[i-w]-g[i+w]); } return s / ((w-2)*(h-2)); }
+function bestShift(A, B, range, step, cx = 0, cy = 0) { // B'yi A'ya oturtan kayma
+  let best = [cx, cy], be = 1e18; const m = Math.ceil(range) + 2 + Math.abs(cx) + Math.abs(cy);
+  for (let dy = cy - range; dy <= cy + range; dy++) for (let dx = cx - range; dx <= cx + range; dx++) {
+    let e = 0;
+    for (let y = m; y < A.h - m; y += step) for (let x = m; x < A.w - m; x += step) e += Math.abs(A.g[y*A.w+x] - B.g[(y+dy)*B.w + x+dx]);
+    if (e < be) { be = e; best = [dx, dy]; }
+  }
+  return best;
+}
+async function stackSharpen(cvs) { // hizala, ağırlıklı ortala, hafif keskinleştir
+  const W = cvs[0].width, H = cvs[0].height;
+  const small = cvs.map(c => grayOf(c, 512)), sh = small.map(lapSharp), ri = sh.indexOf(Math.max(...sh));
+  const mid = cvs.map(c => grayOf(c, 1024));
+  const acc = new Float32Array(W*H*3); let wsum = 0;
+  for (let k = 0; k < cvs.length; k++) {
+    if (sh[k] < 0.6 * sh[ri]) continue;
+    let dx = 0, dy = 0;
+    if (k !== ri) { const s1 = bestShift(small[ri], small[k], 10, 2); const s2 = bestShift(mid[ri], mid[k], 2, 2, s1[0]*2, s1[1]*2); dx = s2[0] * W / 1024; dy = s2[1] * W / 1024; }
+    const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(cvs[ri], 0, 0); x.drawImage(cvs[k], -dx, -dy);
+    const d = x.getImageData(0, 0, W, H).data, w = (sh[k] / sh[ri]) ** 2;
+    for (let i = 0, j = 0; i < d.length; i += 4, j += 3) { acc[j] += d[i]*w; acc[j+1] += d[i+1]*w; acc[j+2] += d[i+2]*w; }
+    wsum += w; c.width = c.height = 0; await tick();
+  }
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const ox = out.getContext('2d', { willReadFrequently: true }), id = ox.createImageData(W, H), o = id.data;
+  const avg = new Float32Array(W*H*3); for (let j = 0; j < avg.length; j++) avg[j] = acc[j] / wsum;
+  const amt = cvs.length > 1 ? 0.8 : 0.5;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const j = (y*W+x)*3, xm = Math.max(0, x-1), xp = Math.min(W-1, x+1), ym = Math.max(0, y-1), yp = Math.min(H-1, y+1);
+    for (let c = 0; c < 3; c++) {
+      const blur = (avg[(ym*W+x)*3+c] + avg[(yp*W+x)*3+c] + avg[(y*W+xm)*3+c] + avg[(y*W+xp)*3+c] + 4*avg[j+c]) / 8;
+      o[(y*W+x)*4+c] = clamp(avg[j+c] + amt * (avg[j+c] - blur), 0, 255);
+    }
+    o[(y*W+x)*4+3] = 255;
+  }
+  ox.putImageData(id, 0, 0);
+  return out;
+}
+async function bakeMouth(srcs, F, colsF, pos, skinHex) {
+  const { uv, aspect } = mouthUV(pos), SW = 2048, SH = clamp(Math.round(SW * aspect / 16) * 16, 256, 2048);
+  const ones = new Float32Array(NV).fill(1), cvs = [];
+  for (const s of srcs) {
+    const cs = sampleColors(s.cv, s.P), sf = [0, 0, 0], sv = [0, 0, 0];
+    for (let i = 0; i < NV; i++) if (MOUTH.mask[i]) for (let c = 0; c < 3; c++) { sf[c] += colsF[i*3+c]; sv[c] += cs[i*3+c]; }
+    s.gain = s === F ? [1, 1, 1] : sf.map((x, c) => clamp(x / Math.max(1, sv[c]), 0.75, 1.35));
+    // yalnız bu karede kameraya bakan üçgenler (dudak içi kıvrımları dişlerin üstüne binmesin)
+    let area = 0; for (let t = 0; t < MOUTH.tris.length; t += 3) area += signedArea2(F.P, MOUTH.tris[t], MOUTH.tris[t+1], MOUTH.tris[t+2]);
+    const front = []; for (let t = 0; t < MOUTH.tris.length; t += 3) { const a = MOUTH.tris[t], b = MOUTH.tris[t+1], c = MOUTH.tris[t+2]; if (signedArea2(s.P, a, b, c) * area > 0) front.push(a, b, c); }
+    cvs.push(bake([s], [ones], skinHex, uv, front, SW, SH, bakeMatReplace));
+    await tick();
+  }
+  const out = await stackSharpen(cvs);
+  cvs.forEach(c => c.width = c.height = 0);
+  return out;
+}
+async function buildModel(views) {
   const F = pickFrontal(views), fi = views.indexOf(F);
   // geometri: önden kare (y yukarı, z kameraya)
   const raw = new Float32Array(NV*3);
@@ -758,15 +947,20 @@ function buildModel(views) {
   const c1 = sampleAt(F.cv, F.P[50*3], F.P[50*3+1], F.eye*0.04), c2 = sampleAt(F.cv, F.P[280*3], F.P[280*3+1], F.eye*0.04);
   const skinC = [(c1[0]+c2[0])/2, (c1[1]+c2[1])/2, (c1[2]+c2[2])/2];
   const atlas = bake(views, W, rgbToHex(skinC));
+  status('Ağız bölgesi işleniyor…', '', 0.92); await tick();
+  const mouthSrcs = col.close.length ? col.close : col.front.length ? col.front : [F];
+  const mouthTex = await bakeMouth(mouthSrcs, F, cols[fi], pos, rgbToHex(skinC));
+  const mt = new THREE.CanvasTexture(mouthTex); mt.colorSpace = THREE.SRGBColorSpace; mt.anisotropy = 8;
+  if (matMouth.map) matMouth.map.dispose(); matMouth.map = mt; matMouth.needsUpdate = true;
   // saç rengi: alın üstü
   const hx = F.P[10*3] + (F.P[10*3] - F.P[1*3]) * 0.35, hy = F.P[10*3+1] + (F.P[10*3+1] - F.P[1*3+1]) * 0.35;
   const hair = hy > 4 ? sampleAt(F.cv, hx, hy, F.eye * 0.08) : hexToRgb($('hair').value);
   $('hair').value = rgbToHex(hair);
   const tex = new THREE.CanvasTexture(atlas); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
   if (matTex.map) matTex.map.dispose(); matTex.map = tex; matTex.needsUpdate = true;
-  model = { pos, atlas, skin: skinC, hair, eyeRaw: vdist(pos, 33, 263), name: '' };
+  model = { pos, atlas, mouthTex, skin: skinC, hair, eyeRaw: vdist(pos, 33, 263), name: '' };
   mode = 'tex'; $('m-tex').disabled = false;
-  setModelMeshes(pos, atlas, skinC, hair); clearMeasure(); frontView();
+  setModelMeshes(pos, atlas, skinC, hair, mouthTex); clearMeasure(); frontView();
   $('tag').textContent = 'Sizin modeliniz · parmakla döndürün';
   $('export').disabled = false; $('save').disabled = false;
   renderMeasurements(); renderStrip(views, F);
@@ -816,7 +1010,7 @@ canvas.addEventListener('pointerup', e => {
   if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 8 || performance.now() - down.t > 400) return;
   const r = canvas.getBoundingClientRect(); ptr.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   ray.setFromCamera(ptr, cam);
-  const hit = ray.intersectObjects([faceMesh, headOn ? headMesh : null, headOn ? neckMesh : null].filter(Boolean), false)[0];
+  const hit = ray.intersectObjects([faceMesh, mouthMesh, headOn ? headMesh : null, headOn ? neckMesh : null].filter(Boolean), false)[0];
   if (!hit) return;
   if (mpts.length === 2) clearMeasure();
   mpts.push(hit.point.clone());
@@ -851,7 +1045,8 @@ $('save').onclick = async () => {
   try {
     const name = $('patient').value.trim() || 'İsimsiz hasta';
     const png = await (await new Promise(r => model.atlas.toBlob(r, 'image/png'))).arrayBuffer();
-    const rec = { id: model.id || ('s' + Date.now()), name, date: new Date().toISOString(), pos: Array.from(model.pos), atlas: png,
+    const mouth = model.mouthTex ? await (await new Promise(r => model.mouthTex.toBlob(r, 'image/png'))).arrayBuffer() : null;
+    const rec = { id: model.id || ('s' + Date.now()), name, date: new Date().toISOString(), pos: Array.from(model.pos), atlas: png, mouth,
       skin: model.skin, hair: model.hair, mm: parseFloat($('mm').value) || 90, thumb: snapshot() };
     await db.put(rec); model.id = rec.id; model.name = name;
     $('exportNote').textContent = `"${name}" bu telefona kaydedildi.`;
@@ -882,11 +1077,18 @@ async function openRecord(id) {
   const img = new Image(); img.src = URL.createObjectURL(new Blob([r.atlas], { type: 'image/png' })); await img.decode();
   const atlas = document.createElement('canvas'); atlas.width = atlas.height = ATLAS; atlas.getContext('2d').drawImage(img, 0, 0, ATLAS, ATLAS); URL.revokeObjectURL(img.src);
   const pos = new Float32Array(r.pos);
+  let mouthTex = null;
+  if (r.mouth) {
+    const mi = new Image(); mi.src = URL.createObjectURL(new Blob([r.mouth], { type: 'image/png' })); await mi.decode();
+    mouthTex = document.createElement('canvas'); mouthTex.width = mi.naturalWidth; mouthTex.height = mi.naturalHeight; mouthTex.getContext('2d').drawImage(mi, 0, 0); URL.revokeObjectURL(mi.src);
+    const mt = new THREE.CanvasTexture(mouthTex); mt.colorSpace = THREE.SRGBColorSpace; mt.anisotropy = 8;
+    if (matMouth.map) matMouth.map.dispose(); matMouth.map = mt; matMouth.needsUpdate = true;
+  }
   const tex = new THREE.CanvasTexture(atlas); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
   if (matTex.map) matTex.map.dispose(); matTex.map = tex; matTex.needsUpdate = true;
-  model = { id: r.id, pos, atlas, skin: r.skin, hair: r.hair, eyeRaw: vdist(pos, 33, 263), name: r.name };
+  model = { id: r.id, pos, atlas, mouthTex, skin: r.skin, hair: r.hair, eyeRaw: vdist(pos, 33, 263), name: r.name };
   $('mm').value = r.mm; $('patient').value = r.name; $('hair').value = rgbToHex(r.hair);
-  mode = 'tex'; $('m-tex').disabled = false; setModelMeshes(pos, atlas, r.skin, r.hair); clearMeasure(); frontView();
+  mode = 'tex'; $('m-tex').disabled = false; setModelMeshes(pos, atlas, r.skin, r.hair, mouthTex); clearMeasure(); frontView();
   $('tag').textContent = r.name + ' · kayıttan açıldı'; $('export').disabled = false; $('save').disabled = false;
   $('status').hidden = true; renderMeasurements();
   $('stage').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -904,19 +1106,19 @@ function mergeGeos(geos) {
   for (const g of geos) { const p = g.attributes.position.array; for (let i = 0; i < p.length; i++) P.push(p[i]); const idx = g.index.array; for (let i = 0; i < idx.length; i++) I.push(idx[i] + off); off += p.length / 3; }
   const m = new THREE.BufferGeometry(); m.setAttribute('position', new THREE.Float32BufferAttribute(P, 3)); m.setIndex(I); m.computeVertexNormals(); return m;
 }
-// yüzü 3 kez böler (her üçgen 64 parça), köşe renklerini doku haritasından alır
-function denseFace(fg, atlas) {
-  let P = Array.from(fg.attributes.position.array), T = Array.from(fg.attributes.uv.array), I = Array.from(fg.index.array);
-  for (let lvl = 0; lvl < 3; lvl++) {
+// yüzü böler (her seviye üçgeni 4'e), köşe renklerini dokudan alır
+function denseFace(P0, uvArr, idx, tex, levels) {
+  let P = Array.from(P0), T = Array.from(uvArr), I = Array.from(idx);
+  for (let lvl = 0; lvl < levels; lvl++) {
     const cache = new Map(), NI = [];
-    const mid = (a, b) => { const k = a < b ? a * 1e6 + b : b * 1e6 + a; let m = cache.get(k); if (m !== undefined) return m;
+    const mid = (a, b) => { const k = a < b ? a * 1e7 + b : b * 1e7 + a; let m = cache.get(k); if (m !== undefined) return m;
       m = P.length / 3; P.push((P[a*3]+P[b*3])/2, (P[a*3+1]+P[b*3+1])/2, (P[a*3+2]+P[b*3+2])/2); T.push((T[a*2]+T[b*2])/2, (T[a*2+1]+T[b*2+1])/2); cache.set(k, m); return m; };
     for (let t = 0; t < I.length; t += 3) { const a = I[t], b = I[t+1], c = I[t+2], ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
       NI.push(a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca); }
     I = NI;
   }
-  const d = atlas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, ATLAS, ATLAS).data, n = P.length / 3, C = new Uint8Array(n * 3);
-  for (let i = 0; i < n; i++) { const x = clamp(Math.round(T[i*2]*ATLAS), 0, ATLAS-1), y = clamp(Math.round((1-T[i*2+1])*ATLAS), 0, ATLAS-1), o = (y*ATLAS+x)*4; C[i*3] = d[o]; C[i*3+1] = d[o+1]; C[i*3+2] = d[o+2]; }
+  const TW = tex.width, TH = tex.height, d = tex.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, TW, TH).data, n = P.length / 3, C = new Uint8Array(n * 3);
+  for (let i = 0; i < n; i++) { const x = clamp(Math.round(T[i*2]*TW), 0, TW-1), y = clamp(Math.round((1-T[i*2+1])*TH), 0, TH-1), o = (y*TW+x)*4; C[i*3] = d[o]; C[i*3+1] = d[o+1]; C[i*3+2] = d[o+2]; }
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3)); g.setIndex(I); g.computeVertexNormals();
   return { g, C };
 }
@@ -940,17 +1142,22 @@ $('export').onclick = async () => {
   const btn = $('export'); btn.disabled = true; const old = btn.textContent; btn.textContent = 'Hazırlanıyor…';
   try {
     const k = mmScale(), mm = clamp(parseFloat($('mm').value) || 90, 60, 130);
-    const fg = scaledGeo(faceMesh, k), parts = [fg];
+    const fg = faceGeoFull.clone(); fg.scale(k, k, k); fg.computeVertexNormals();
+    const parts = [fg], hasMouth = !!model.mouthTex, muv = hasMouth ? mouthUV(model.pos).uv : null;
+    const fIdx = fg.index.array, restI = [], mouthI = [];
+    for (let t = 0; t < NT; t++) ((hasMouth && MOUTH.triMask[t]) ? mouthI : restI).push(fIdx[t*3], fIdx[t*3+1], fIdx[t*3+2]);
     const hg = headOn ? scaledGeo(headMesh, k) : null, ng = headOn ? scaledGeo(neckMesh, k) : null;
     if (headOn) parts.push(hg, ng);
     // OBJ
-    const fP = fg.attributes.position.array, fN = fg.attributes.normal.array, fI = fg.index.array;
+    const fP = fg.attributes.position.array, fN = fg.attributes.normal.array;
     let obj = '# Gülüş 3D · birim: mm\nmtllib model.mtl\no yuz\n';
     for (let i = 0; i < NV; i++) obj += `v ${fP[i*3].toFixed(3)} ${fP[i*3+1].toFixed(3)} ${fP[i*3+2].toFixed(3)}\n`;
     for (let i = 0; i < NV; i++) obj += `vt ${UV[i][0]} ${UV[i][1]}\n`;
+    if (hasMouth) for (let i = 0; i < NV; i++) obj += `vt ${muv[i*2].toFixed(5)} ${muv[i*2+1].toFixed(5)}\n`;
     for (let i = 0; i < NV; i++) obj += `vn ${fN[i*3].toFixed(4)} ${fN[i*3+1].toFixed(4)} ${fN[i*3+2].toFixed(4)}\n`;
     obj += 'usemtl yuz\ns 1\n';
-    for (let t = 0; t < fI.length; t += 3) { const [a, b, c] = [fI[t]+1, fI[t+1]+1, fI[t+2]+1]; obj += `f ${a}/${a}/${a} ${b}/${b}/${b} ${c}/${c}/${c}\n`; }
+    for (let t = 0; t < restI.length; t += 3) { const [a, b, c] = [restI[t]+1, restI[t+1]+1, restI[t+2]+1]; obj += `f ${a}/${a}/${a} ${b}/${b}/${b} ${c}/${c}/${c}\n`; }
+    if (hasMouth) { obj += 'usemtl agiz\n'; for (let t = 0; t < mouthI.length; t += 3) { const [a, b, c] = [mouthI[t]+1, mouthI[t+1]+1, mouthI[t+2]+1]; obj += `f ${a}/${a+NV}/${a} ${b}/${b+NV}/${b} ${c}/${c+NV}/${c}\n`; } }
     let vOff = NV;
     if (headOn) for (const [g, name] of [[hg, 'kafa'], [ng, 'boyun']]) {
       const p = g.attributes.position.array, n = g.attributes.normal.array, c = g.attributes.color.array, idx = g.index.array, cnt = p.length / 3;
@@ -962,18 +1169,20 @@ $('export').onclick = async () => {
       vOff += cnt;
     }
     const sk = model.skin.map(x => x.toFixed(3)).join(' ');
-    const mtl = `newmtl yuz\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd model_doku.png\n\nnewmtl kafa\nKa 1 1 1\nKd ${sk}\nKs 0 0 0\nillum 1\n`;
+    const mtl = `newmtl yuz\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd model_doku.png\n${hasMouth ? '\nnewmtl agiz\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd model_agiz.png\n' : ''}\nnewmtl kafa\nKa 1 1 1\nKd ${sk}\nKs 0 0 0\nillum 1\n`;
     const png = new Uint8Array(await (await new Promise(r => model.atlas.toBlob(r, 'image/png'))).arrayBuffer());
     const stl = new Uint8Array(new STLExporter().parse(new THREE.Mesh(mergeGeos(parts)), { binary: true }).buffer);
-    const grp = new THREE.Group(); grp.add(new THREE.Mesh(fg, matTex)); if (headOn) grp.add(new THREE.Mesh(hg, matHead), new THREE.Mesh(ng, matHead));
+    const mkSub = (uvA, I) => { const g = new THREE.BufferGeometry(); g.setAttribute('position', fg.attributes.position); g.setAttribute('normal', fg.attributes.normal); g.setAttribute('uv', new THREE.BufferAttribute(uvA, 2)); g.setIndex(I); return g; };
+    const grp = new THREE.Group(); grp.add(new THREE.Mesh(mkSub(UVFLAT.slice(), restI), matTex)); if (hasMouth) grp.add(new THREE.Mesh(mkSub(muv, mouthI), matMouth)); if (headOn) grp.add(new THREE.Mesh(hg, matHead), new THREE.Mesh(ng, matHead));
     const glb = new Uint8Array(await new GLTFExporter().parseAsync(grp, { binary: true }));
-    const dense = denseFace(fg, model.atlas), plyParts = [dense];
+    const plyParts = [denseFace(fP, UVFLAT, restI, model.atlas, hasMouth ? 3 : 3)];
+    if (hasMouth) plyParts.push(denseFace(fP, muv, mouthI, model.mouthTex, 5));
     if (headOn) plyParts.push({ g: hg, C: colorsFromAttr(hg) }, { g: ng, C: colorsFromAttr(ng) });
     const ply = buildPLY(plyParts);
     const name = $('patient').value.trim();
     const lines = MEAS.map(([n, s, a, b]) => `${n} (${s}): ${(vdist(model.pos, a, b) * k).toFixed(1)} mm`).join('\n');
-    const readme = `Gülüş 3D dışa aktarımı${name ? ' · ' + name : ''}\nTarih: ${new Date().toLocaleString('tr-TR')}\nBirim: milimetre (dış göz köşeleri arası ${mm} mm kabul edildi)\n\nmodel.stl : yalnız geometri (exocad, 3Shape, Meshmixer, dilimleyici)\nmodel.ply : renkli model, renk köşelerde (exocad Smile Creator, 3Shape, MeshLab)\nmodel.obj + model.mtl + model_doku.png : dokulu model\nmodel.glb : tek dosyada dokulu model\n${headOn ? '\nKafanın arkası, saç ve boyun taranmamıştır; yüz ölçülerinden tahmini olarak tamamlanmıştır.\n' : ''}\nTahmini ölçüler:\n${lines}\n\nModel yapay zekâ tahminine dayalıdır; klinik ölçüm için kullanmayın.\n`;
-    const zip = zipSync({ 'model.stl': stl, 'model.ply': ply, 'model.obj': enc(obj), 'model.mtl': enc(mtl), 'model_doku.png': [png, { level: 0 }], 'model.glb': glb, 'BENIOKU.txt': enc(readme) });
+    const readme = `Gülüş 3D dışa aktarımı${name ? ' · ' + name : ''}\nTarih: ${new Date().toLocaleString('tr-TR')}\nBirim: milimetre (dış göz köşeleri arası ${mm} mm kabul edildi)\n\nmodel.stl : yalnız geometri (exocad, 3Shape, Meshmixer, dilimleyici)\nmodel.ply : renkli model, renk köşelerde (exocad Smile Creator, 3Shape, MeshLab)\nmodel.obj + model.mtl + model_doku.png${hasMouth ? " + model_agiz.png" : ""} : dokulu model${hasMouth ? " (ağız ayrı, yüksek çözünürlüklü dokuyla)" : ""}\nmodel.glb : tek dosyada dokulu model\n${headOn ? '\nKafanın arkası, saç ve boyun taranmamıştır; yüz ölçülerinden tahmini olarak tamamlanmıştır.\n' : ''}\nTahmini ölçüler:\n${lines}\n\nModel yapay zekâ tahminine dayalıdır; klinik ölçüm için kullanmayın.\n`;
+    const zip = zipSync({ 'model.stl': stl, 'model.ply': ply, 'model.obj': enc(obj), 'model.mtl': enc(mtl), 'model_doku.png': [png, { level: 0 }], ...(hasMouth ? { 'model_agiz.png': [new Uint8Array(await (await new Promise(r => model.mouthTex.toBlob(r, 'image/png'))).arrayBuffer()), { level: 0 }] } : {}), 'model.glb': glb, 'BENIOKU.txt': enc(readme) });
     const now = new Date(), p2 = n => String(n).padStart(2, '0');
     const file = `gulus3d_${slug(name)}_${now.getFullYear()}${p2(now.getMonth()+1)}${p2(now.getDate())}_${p2(now.getHours())}${p2(now.getMinutes())}.zip`;
     const blob = new Blob([zip], { type: 'application/zip' });
