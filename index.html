@@ -135,7 +135,7 @@ details li span{color:var(--muted)}
         <li>Telefonu yüzden 40–50 cm uzakta, göz hizasında tutun. Yüz ekranın büyük kısmını kaplasın.</li>
         <li>Hasta başını <strong>yavaşça</strong> ok yönünde çevirir: önce bir yana, sonra öbür yana, sonra hafif öne ve yukarı.</li>
         <li>Düz, gölgesiz ışık kullanın. Arkadan gelen ışık (pencere) dokuyu bozar. Flaş kullanmayın, dişlerde parlama yapar.</li>
-        <li>Tarama sonunda program <strong>ağız yakın çekimi</strong> ister: telefonu gülüşe 20–25 cm yaklaştırıp ağız hizasında sabit tutun. Dişlerin netliği bu adımdan gelir.</li>
+        <li>Tarama sonunda program <strong>ağız yakın çekimi</strong> ister: telefonu gülüşe 15–20 cm yaklaştırıp ağız hizasında 5 saniye sabit tutun. Dişlerin netliği bu adımdan gelir.</li>
         <li>Galeriden seçerken ağzı yakından çekilmiş net bir fotoğrafı da ekleyebilirsiniz; program onu ağız için kullanır.</li>
       </ol>
     </details>
@@ -500,7 +500,7 @@ const isClose = (ev, src) => ev.mw >= 0.12 * Math.max(src.width, src.height) && 
 function considerExtra(src, P, ev, noClose) { // ağız için: en net önden kareler ve yakın çekimler
   let k = false;
   if (Math.abs(ev.yaw) <= 8 && Math.abs(ev.rp) <= 10 && ev.eye >= 45) k = keepTop(col.front, src, P, ev, 3) || k;
-  if (!noClose && isClose(ev, src)) k = keepTop(col.close, src, P, ev, 3) || k;
+  if (!noClose && isClose(ev, src)) k = keepTop(col.close, src, P, ev, CLOSE_N) || k;
   return k;
 }
 function evaluate(src, P, loose) {
@@ -552,7 +552,7 @@ async function onFiles(e) {
       if (!Pb) continue;
       col.faces++;
       const evb = evaluate(big, Pb, true);
-      if (isClose(evb, big)) keepTop(col.close, big, Pb, evb, 3);
+      if (isClose(evb, big)) keepTop(col.close, big, Pb, evb, CLOSE_N);
       const full = fitCanvas(big.width, big.height, 1600), k = full.width / big.width;
       full.getContext('2d').drawImage(big, 0, 0, full.width, full.height);
       const P = Pb.map(x => x * k), ev = evaluate(full, P, true);
@@ -633,10 +633,10 @@ function setPhaseUI() {
   const m = live.phase === 'mouth';
   $('lvMap').hidden = m; $('lvSkip').hidden = !m;
   $('lvDone').textContent = m ? 'Şimdi çek' : 'Devam: ağız yakın çekimi';
-  if (m) { $('lvDone').disabled = false; $('lvHint').textContent = 'Program net anı kendisi yakalar; isterseniz "Şimdi çek"e basın.'; }
+  if (m) { $('lvDone').disabled = false; $('lvHint').textContent = 'Doğru mesafede 5 saniye tutun; program en net 5 kareyi seçer.'; }
 }
 async function startMouthPhase() {
-  live.phase = 'mouth'; live.mouthStart = performance.now(); live.bestMsh = 0; live.lastClose = 0;
+  live.phase = 'mouth'; live.mouthStart = performance.now(); live.bestMsh = 0; live.lastClose = 0; live.held = 0; live.lastTick = 0;
   setPhaseUI(); updateCount();
   const tr = live.stream && live.stream.getVideoTracks()[0];
   if (tr) { // ağız için en yüksek çözünürlük ve sürekli netleme
@@ -650,8 +650,8 @@ async function grabClose(manual) { // tam çözünürlükte kare al, yüzü yeni
   const P = await detect(smallFrom(big, fitCanvas(big.width, big.height, 640)), big.width, big.height);
   if (!P) { big.width = big.height = 0; if (manual) flashGuide('Yüz bulunamadı, biraz uzaklaşın'); return false; }
   const ev = evaluate(big, P, false);
-  const ok = keepTop(col.close, big, P, ev, 3); big.width = big.height = 0;
-  if (ok) { live.flashUntil = performance.now() + 600; try { navigator.vibrate && navigator.vibrate(25); } catch {} updateCount(); }
+  const ok = keepTop(col.close, big, P, ev, CLOSE_N); big.width = big.height = 0;
+  if (ok && manual) { try { navigator.vibrate && navigator.vibrate(25); } catch {} }
   return ok;
 }
 function flashGuide(t) { $('lvGuide').textContent = t; $('lvGuide').className = 'guide'; }
@@ -677,25 +677,31 @@ async function liveLoop() {
     await new Promise(r => requestAnimationFrame(r));
   }
 }
+const CLOSE_N = 5, CLOSE_SECS = 5, CLOSE_MIN = 0.22, CLOSE_MAX = 0.34; // ağız genişliği / kare uzun kenarı
 async function mouthStep(P, full) {
   drawOverlay(P, full, true);
-  const g = $('lvGuide'); let t, good = false;
+  const g = $('lvGuide'), now = performance.now(); let t, good = false, inRange = false;
   if (!P) t = 'Yüz görünmüyor, biraz uzaklaşın';
   else {
     const ev = evaluate(full, P, false), ratio = ev.mw / Math.max(full.width, full.height);
-    if (ratio < 0.13) t = 'Telefonu gülüşe yaklaştırın';
+    if (ratio < CLOSE_MIN) t = ratio < CLOSE_MIN * 0.75 ? 'Telefonu gülüşe yaklaştırın' : 'Biraz daha yaklaştırın';
+    else if (ratio > CLOSE_MAX) t = 'Çok yakın, biraz uzaklaşın';
     else if (Math.abs(ev.yaw) > 12 || Math.abs(ev.rp) > 14) t = 'Kameraya düz baksın, telefon ağız hizasında';
     else if (ev.lum < 55) t = 'Işık yetersiz';
     else {
+      inRange = true;
       live.bestMsh = Math.max(live.bestMsh * 0.995, ev.msh);
-      t = 'Sabit tutun…'; good = true;
-      const now = performance.now();
-      if (ev.msh >= 0.85 * live.bestMsh && now - live.lastClose > 300) { live.lastClose = now; await grabClose(false); }
+      if (ev.msh >= 0.8 * live.bestMsh && now - live.lastClose > 250) { live.lastClose = now; await grabClose(false); }
+      const left = Math.max(0, CLOSE_SECS - live.held / 1000);
+      t = `Sabit tutun… ${Math.ceil(left)} sn`; good = true;
     }
   }
-  if (performance.now() < live.flashUntil) { t = '✓ Ağız çekildi (' + col.close.length + '/3)'; good = true; }
+  // süre yalnız doğru mesafede ve düz bakarken ilerler
+  if (inRange && live.lastTick) live.held += Math.min(250, now - live.lastTick);
+  live.lastTick = now;
   g.textContent = t; g.className = 'guide' + (good ? ' good' : '');
-  if (col.close.length >= 3 && performance.now() - live.mouthStart > 2500) { g.textContent = 'Tamam!'; await new Promise(r => setTimeout(r, 400)); closeLive(); await finishCollect(); }
+  updateCount();
+  if (live.held >= CLOSE_SECS * 1000 && col.close.length) { g.textContent = 'Tamam!'; await new Promise(r => setTimeout(r, 400)); closeLive(); await finishCollect(); }
 }
 const isMirror = () => live.facing === 'user';
 function drawOverlay(P, full, lipsOnly) {
@@ -734,7 +740,7 @@ function drawMap(ev) {
 function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x+r, y); ctx.arcTo(x+w, y, x+w, y+h, r); ctx.arcTo(x+w, y+h, x, y+h, r); ctx.arcTo(x, y+h, x, y, r); ctx.arcTo(x, y, x+w, y, r); ctx.closePath(); }
 function updateCount() {
   const n = col ? BIN_IDS.filter(b => col.bins[b]).length : 0;
-  $('lvCount').textContent = live.phase === 'mouth' ? `Ağız ${col ? col.close.length : 0} / 3` : `${n} / 9 açı`;
+  $('lvCount').textContent = live.phase === 'mouth' ? `Ağız ${(Math.min(live.held || 0, CLOSE_SECS*1000) / 1000).toFixed(1)} / ${CLOSE_SECS} sn` : `${n} / 9 açı`;
   if (live.phase === 'mouth') return;
   const ok = col && col.bins.C && ['L0','L1','L2'].some(b => col.bins[b]) && ['R0','R1','R2'].some(b => col.bins[b]);
   $('lvDone').disabled = !ok;
